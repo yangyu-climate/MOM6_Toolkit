@@ -1,0 +1,9 @@
+{
+  "soda_dir": "/user/yang.yu/Data/SODA/SODA3.15.2",
+  "hgrid": "/user/yang.yu/Clark/application/MOM6/crocodile2026/croc_input/tropaci/ocn/ocean_hgrid_tropac_70e8e5.nc",
+  "output_dir": "MOM6_SODA",
+  "start": "1981-01-01",
+  "end": "2021-01-01",
+  "initial_date": "1981-01-02",
+  "pattern": "soda3.15.2_5dy_ocean_or_*.nc"
+}

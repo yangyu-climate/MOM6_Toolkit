@@ -1,0 +1,7 @@
+{
+  "input_dir": "/user/yang.yu/Data/NCEP",
+  "output_dir": "MOM6_DATM",
+  "year_start": 1981,
+  "year_end": 2021,
+  "mesh_exe": "ESMF_Scrip2Unstruct"
+}

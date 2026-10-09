@@ -123,7 +123,10 @@ def fill_nearest(values: np.ndarray, fallback: float = 0.0) -> np.ndarray:
     leading = result.shape[:-2]
     for index in np.ndindex(leading):
         plane = result[index]
-        valid = np.isfinite(plane)
+        # SODA/NetCDF masked values can arrive as finite values such as 1e20.
+        # Treat these sentinels as missing before nearest-neighbor filling.
+        valid = np.isfinite(plane) & (np.abs(plane) < 0.5 * float(FILL))
+        plane[~valid] = np.nan
         if not valid.any():
             result[index] = fallback
             continue
@@ -131,6 +134,14 @@ def fill_nearest(values: np.ndarray, fallback: float = 0.0) -> np.ndarray:
             nearest = distance_transform_edt(~valid, return_distances=False,
                                              return_indices=True)
             result[index][~valid] = plane[tuple(nearest[:, ~valid])]
+    return result
+
+
+def fill_zero(values: np.ndarray) -> np.ndarray:
+    """Replace NaNs and NetCDF missing-value sentinels with zero."""
+    result = np.asarray(values, dtype="f4").copy()
+    invalid = (~np.isfinite(result)) | (np.abs(result) >= 0.5 * float(FILL))
+    result[invalid] = 0.0
     return result
 
 
@@ -142,6 +153,16 @@ def regular_axis(da: xr.DataArray, dim: str, values: np.ndarray, axis: int) -> t
     values = np.take(values, order, axis=axis)
     keep = np.r_[True, np.diff(coord) > 0.0]
     return coord[keep], np.take(values, np.flatnonzero(keep), axis=axis)
+
+
+def time_weighted(before_date: np.datetime64, before: tuple[np.ndarray, ...],
+                  after_date: np.datetime64, after: tuple[np.ndarray, ...],
+                  target: np.datetime64) -> tuple[np.ndarray, ...]:
+    """Linearly interpolate a group of fields to a target time."""
+    denominator = (after_date - before_date) / np.timedelta64(1, "s")
+    weight = ((target - before_date) / np.timedelta64(1, "s")) / denominator
+    return tuple((1.0 - weight) * left + weight * right
+                 for left, right in zip(before, after))
 
 
 def load_config(path: Path) -> SimpleNamespace:
@@ -156,16 +177,20 @@ def load_config(path: Path) -> SimpleNamespace:
     cfg["output_dir"] = Path(cfg["output_dir"])
     cfg.setdefault("pattern", "soda3.15.2_5dy_ocean_or_*.nc")
     cfg.setdefault("log_file", "generate_soda_icbc.log")
+    cfg.setdefault("initial_date", None)
     return SimpleNamespace(**cfg)
 
 
 def lon_for_source(lon: np.ndarray, target: np.ndarray) -> np.ndarray:
     """Put target longitudes in the same convention as SODA."""
     out = np.asarray(target, dtype=float).copy()
-    if np.nanmax(lon) <= 180 and np.nanmin(lon) < 0:
-        out[out > 180] -= 360
-    elif np.nanmin(lon) >= 0:
-        out[out < 0] += 360
+    source_min = np.nanmin(lon)
+    source_max = np.nanmax(lon)
+    # Handle regional conventions such as SODA's -280..80 grid.  A target
+    # longitude is shifted by full turns until it falls in the source range.
+    for _ in range(3):
+        out[out < source_min] += 360.0
+        out[out > source_max] -= 360.0
     return out
 
 
@@ -216,17 +241,19 @@ def main() -> None:
     start = np.datetime64(a.start)
     end = np.datetime64(a.end)
     initial = np.datetime64(a.initial_date) if a.initial_date else start
-    files = []
+    all_files = []
     for path in sorted(a.soda_dir.glob(a.pattern)):
         # Filename suffix is YYYY_MM_DD.
         date = np.datetime64(path.stem[-10:].replace("_", "-"))
-        if start <= date <= end:
-            files.append((date, path))
-    if not files:
+        all_files.append((date, path))
+    all_files.sort()
+    inside = [i for i, (date, _) in enumerate(all_files) if start <= date <= end]
+    if not inside:
         raise FileNotFoundError(f"No SODA files in {a.soda_dir} between {a.start} and {a.end}")
-    files.sort()
-    ic_file = min(files, key=lambda item: abs(item[0] - initial))[1]
-    log.info("Found %d SODA files; initial condition uses: %s", len(files), ic_file.name)
+    first = max(0, inside[0] - 1)
+    last = min(len(all_files), inside[-1] + 2)
+    files = all_files[first:last]
+    log.info("Found %d SODA files in the requested period plus boundary brackets", len(files))
 
     log.info("Reading MOM6 hgrid: %s", a.hgrid)
     with xr.open_dataset(a.hgrid, decode_times=False) as grid:
@@ -252,6 +279,10 @@ def main() -> None:
     depth_edges = None
     writers = {}
     t0 = np.datetime64(a.start)
+    previous_center = None
+    previous_obc = {}
+    started = set()
+    ended = set()
     for index, (date, path) in enumerate(files, 1):
         log.info("[%d/%d] Reading and interpolating: %s", index, len(files), path.name)
         with xr.open_dataset(path, decode_times=False) as ds:
@@ -275,36 +306,64 @@ def main() -> None:
             v_center = interp(ds["v"], "st_ocean", "yu_ocean", "xu_ocean", z, v_y, v_xs)
             temp = fill_nearest(temp)
             salt = fill_nearest(salt)
-            eta = fill_nearest(eta)
-            u_center = fill_nearest(u_center)
-            v_center = fill_nearest(v_center)
-            if date == np.datetime64(ic_file.stem[-10:].replace("_", "-")):
-                initial_fields = (temp, salt, eta, u_center, v_center)
+            eta = fill_zero(eta)
+            u_center = fill_zero(u_center)
+            v_center = fill_zero(v_center)
+            center_fields = (temp, salt, eta, u_center, v_center)
+            if date == initial:
+                initial_fields = center_fields
+            elif (initial_fields is None and previous_center is not None
+                  and previous_center[0] < initial < date):
+                initial_fields = time_weighted(
+                    previous_center[0], previous_center[1], date,
+                    center_fields, initial)
+                log.info("Time-weighted initial condition at %s", initial)
+            previous_center = (date, center_fields)
 
             for seg, (yy, xx) in {1: (south_y, south_x), 2: (north_y, north_x), 3: (west_y, west_x)}.items():
                 # For OBCs use the same SODA C-grid variables and retain the
                 # supergrid boundary lengths expected by MOM6.
-                ty = lon_for_source(source_lat, yy)
+                ty = yy
                 tx = lon_for_source(source_lon, xx)
                 tu = interp(ds["u"], "st_ocean", "yu_ocean", "xu_ocean", z, ty, lon_for_source(source_xu, xx))
-                tv = interp(ds["v"], "st_ocean", "yu_ocean", "xu_ocean", z, lon_for_source(source_yu, yy), tx)
+                tv = interp(ds["v"], "st_ocean", "yu_ocean", "xu_ocean", z, yy, tx)
                 tt = interp(ds["temp"], "st_ocean", "yt_ocean", "xt_ocean", z, ty, tx)
                 ts = interp(ds["salt"], "st_ocean", "yt_ocean", "xt_ocean", z, ty, tx)
                 te = interp(ds["ssh"], None, "yt_ocean", "xt_ocean", None, ty, tx)
-                tu = fill_nearest(tu)
-                tv = fill_nearest(tv)
+                tu = fill_zero(tu)
+                tv = fill_zero(tv)
                 tt = fill_nearest(tt)
                 ts = fill_nearest(ts)
-                te = fill_nearest(te)
+                te = fill_zero(te)
+                current = (tu, tv, te, tt, ts)
                 if seg not in writers:
                     writers[seg] = OBCWriter(
                         a.output_dir / f"forcing_obc_segment_{seg:03d}.nc", seg,
                         depth, np.diff(depth_edges), obc_coords[seg][0],
                         obc_coords[seg][1], t0)
-                    if date > t0:
-                        writers[seg].append(t0, tu, tv, te, tt, ts)
-                writers[seg].append(date, tu, tv, te, tt, ts)
-                log.info("[%d/%d] Wrote segment %03d time slice", index, len(files), seg)
+                previous = previous_obc.get(seg)
+                if date < start:
+                    pass
+                elif seg not in started:
+                    if previous is not None and previous[0] < start:
+                        weighted = time_weighted(previous[0], previous[1], date,
+                                                 current, start)
+                        writers[seg].append(start, *weighted)
+                        log.info("Time-weighted segment %03d start: %s", seg, start)
+                    writers[seg].append(date, *current)
+                    started.add(seg)
+                    log.info("[%d/%d] Wrote segment %03d time slice", index, len(files), seg)
+                elif date <= end:
+                    writers[seg].append(date, *current)
+                    log.info("[%d/%d] Wrote segment %03d time slice", index, len(files), seg)
+                elif seg not in ended:
+                    if previous is not None and previous[0] < end:
+                        weighted = time_weighted(previous[0], previous[1], date,
+                                                 current, end)
+                        writers[seg].append(end, *weighted)
+                        log.info("Time-weighted segment %03d end: %s", seg, end)
+                    ended.add(seg)
+                previous_obc[seg] = (date, current)
         log.info("[%d/%d] Interpolation and missing-value filling complete", index, len(files))
 
     for writer in writers.values():

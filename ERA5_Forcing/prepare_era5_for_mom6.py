@@ -7,6 +7,7 @@ import argparse
 import json
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 
@@ -57,9 +58,31 @@ def load_config(args: argparse.Namespace) -> dict:
     return config
 
 
-def run(command: list[str]) -> None:
-    print("+", " ".join(command))
-    subprocess.run(command, check=True)
+def log_line(log, message: str) -> None:
+    line = f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] {message}"
+    print(line, flush=True)
+    log.write(line + "\n")
+    log.flush()
+
+
+def run(command: list[str], log) -> None:
+    log_line(log, "+ " + " ".join(command))
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        print(line, end="", flush=True)
+        log.write(line)
+        log.flush()
+    return_code = process.wait()
+    if return_code:
+        log_line(log, f"Command failed with exit code: {return_code}")
+        raise subprocess.CalledProcessError(return_code, command)
 
 
 def write_streams(config: dict, years: list[int], output: Path) -> Path:
@@ -95,24 +118,38 @@ def main() -> None:
     script_dir = Path(__file__).parent
     output = Path(config["output_dir"])
     output.mkdir(parents=True, exist_ok=True)
+    log_path = Path(config.get("log_file", "era5_forcing.log"))
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    for year in years:
-        part_dir = Path(config["part_root"]) / str(year)
-        input_dir = Path(config["input_root"]) / str(year)
-        grid = [str(value) for value in config["grid"]]
-        run([
-            sys.executable, str(script_dir / "download_era5_split.py"),
-            "--year", str(year), "--grid", *grid,
-            "--part-dir", str(part_dir), "--out-dir", str(input_dir),
-        ])
-        run([
-            sys.executable, str(script_dir / "process_era5_for_mom6.py"),
-            "--year", str(year), "--input-dir", str(input_dir),
-            "--output-dir", str(output), "--mesh-exe", str(config["mesh_exe"]),
-        ])
+    with log_path.open("a", encoding="utf-8") as log:
+        log_line(log, "Starting multi-year ERA5/MOM6 processing")
+        log_line(log, f"Years: {years}")
+        log_line(log, f"Grid: {config['grid']}")
+        log_line(log, f"Output directory: {output.resolve()}")
+        try:
+            for year in years:
+                log_line(log, f"Starting year: {year}")
+                part_dir = Path(config["part_root"]) / str(year)
+                input_dir = Path(config["input_root"]) / str(year)
+                grid = [str(value) for value in config["grid"]]
+                run([
+                    sys.executable, str(script_dir / "download_era5_split.py"),
+                    "--year", str(year), "--grid", *grid,
+                    "--part-dir", str(part_dir), "--out-dir", str(input_dir),
+                ], log)
+                run([
+                    sys.executable, str(script_dir / "process_era5_for_mom6.py"),
+                    "--year", str(year), "--input-dir", str(input_dir),
+                    "--output-dir", str(output), "--mesh-exe", str(config["mesh_exe"]),
+                ], log)
+                log_line(log, f"Completed year: {year}")
 
-    streams = write_streams(config, years, output)
-    print(f"Wrote {streams}")
+            streams = write_streams(config, years, output)
+            log_line(log, f"Generated DATM configuration: {streams.resolve()}")
+            log_line(log, "Multi-year ERA5/MOM6 processing completed")
+        except Exception as error:
+            log_line(log, f"Processing failed: {error}")
+            raise
 
 
 if __name__ == "__main__":

@@ -111,6 +111,15 @@ The script automatically reads `era5_forcing.json` from the same directory.
 The default parameter file downloads the range `year_start` through
 `year_end`. Command-line options can override the range or grid:
 
+Runtime information is printed to the terminal and written to:
+
+```text
+era5_forcing.log
+```
+
+The log contains download and conversion commands for each year, subprocess
+output, and the path of the generated `user_nl_datm_streams` file.
+
 To use another parameter file, pass `--config` explicitly:
 
 ```bash

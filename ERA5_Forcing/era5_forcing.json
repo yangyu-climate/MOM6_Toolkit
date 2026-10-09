@@ -2,9 +2,10 @@
   "part_root": "ERA5_parts",
   "input_root": "ERA5_input",
   "output_dir": "ERA5_MOM6",
-  "year_start": 2022,
+  "log_file": "era5_forcing.log",
+  "year_start": 2021,
   "year_end": 2022,
-  "grid": [0.5, 0.5],
+  "grid": [0.25, 0.25],
   "mesh_exe": "ESMF_Scrip2Unstruct",
   "streams_template": "user_nl_datm_streams"
 }

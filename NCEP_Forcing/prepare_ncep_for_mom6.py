@@ -186,7 +186,10 @@ def write_field(data: xr.DataArray, name: str, year: int, output: Path) -> None:
                 "dtype": "f8",
                 "units": f"hours since {year}-01-01 00:00:00",
                 "calendar": "noleap",
+                "_FillValue": None,
             },
+            "latitude": {"_FillValue": None},
+            "longitude": {"_FillValue": None},
             name: {"dtype": "f4", "_FillValue": np.float32(1e20)},
         },
     )
@@ -228,15 +231,26 @@ def main() -> None:
     for year in years:
         raw = {name: open_year(input_dir, stem, var, year)
                for name, (stem, var) in FIELDS.items()}
+        # slp is on the 2.5-degree regular grid (73x144), whereas the
+        # remaining NCEP fields use the 1.875-degree Gaussian grid (94x192).
+        # All DATM stream fields must share one source grid.
+        target = raw["t_10"]
+        slp_linear = raw["slp"].interp_like(target, method="linear")
+        slp_nearest = raw["slp"].interp(
+            latitude=target.latitude,
+            longitude=target.longitude,
+            method="nearest",
+        )
+        raw["slp"] = slp_linear.fillna(slp_nearest)
         rh = open_year(input_dir, "rhum.sig995", "rhum", year)
         # rhum.sig995 is 2.5-degree (73x144), while the other NCEP fields
         # use the 1.875-degree Gaussian grid (94x192).  Put RH on the same
         # grid before calculating q_10; nearest fills the periodic longitude
         # endpoint that lies just outside the linear interpolation range.
-        rh_linear = rh.interp_like(raw["t_10"], method="linear")
+        rh_linear = rh.interp_like(target, method="linear")
         rh_nearest = rh.interp(
-            latitude=raw["t_10"].latitude,
-            longitude=raw["t_10"].longitude,
+            latitude=target.latitude,
+            longitude=target.longitude,
             method="nearest",
         )
         rh = rh_linear.fillna(rh_nearest)
@@ -245,7 +259,7 @@ def main() -> None:
         tc = tk - 273.15
         es = 611.2 * np.exp(17.67 * tc / (tc + 243.5))
         e = (rh / 100.0) * es
-        raw["q_10"] = 0.622 * e / (99500.0 - 0.378 * e)
+        raw["q_10"] = (0.622 * e / (99500.0 - 0.378 * e)).clip(min=0.0)
         for name, data in raw.items():
             write_field(data, name, year, output_dir)
     print(f"Wrote {write_streams_file(config, years, output_dir)}")

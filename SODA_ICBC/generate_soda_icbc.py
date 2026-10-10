@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Generate MOM6 IC and OBC files from SODA3.15.2 five-day NetCDF files.
 
-This is tailored to the bering_ocn.001 grid.  It reads SODA's native variables
-(``temp``, ``salt``, ``u``, ``v``, ``ssh``), interpolates them to the MOM6
-supergrid with scipy, and writes the filenames referenced by ``user_nl_mom``.
+It reads SODA's native variables (``temp``, ``salt``, ``u``, ``v``, ``ssh``),
+interpolates them to the MOM6 supergrid, and applies the same important MOM6
+regional-forcing rules used by CrocoDash: bathymetry-aware masks, local water
+column thicknesses, and land/missing-value cleanup.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import xarray as xr
 from netCDF4 import Dataset
 from scipy.ndimage import distance_transform_edt
 from scipy.interpolate import RegularGridInterpolator
+from scipy.spatial import cKDTree
 
 
 FILL = np.float32(1.0e20)
@@ -48,7 +50,7 @@ class OBCWriter:
         tag = f"{segment:03d}"
         self.start = start
         self.depth = depth.astype("f4")
-        self.dz = dz.astype("f4")
+        self.dz = np.asarray(dz, dtype="f4")
         self.ds = Dataset(path, "w", format="NETCDF4_CLASSIC")
         nz = len(depth)
         ny, nx = boundary_y.shape
@@ -109,8 +111,11 @@ class OBCWriter:
         self.ds.variables[f"temp_segment_{self.tag}"][i] = temp.astype("f4")
         self.ds.variables[f"salt_segment_{self.tag}"][i] = salt.astype("f4")
         for name, field in (("temp", temp), ("salt", salt), ("u", u), ("v", v)):
-            self.ds.variables[f"dz_{name}_segment_{self.tag}"][i] = np.broadcast_to(
-                self.dz[:, None, None], field.shape).astype("f4")
+            if self.dz.ndim == 1:
+                layer_dz = np.broadcast_to(self.dz[:, None, None], field.shape)
+            else:
+                layer_dz = np.broadcast_to(self.dz, field.shape)
+            self.ds.variables[f"dz_{name}_segment_{self.tag}"][i] = layer_dz.astype("f4")
         self.ds.sync()
 
     def close(self) -> None:
@@ -120,6 +125,16 @@ class OBCWriter:
 def fill_nearest(values: np.ndarray, fallback: float = 0.0) -> np.ndarray:
     """Fill NaNs in each horizontal plane from the nearest valid value."""
     result = np.asarray(values, dtype="f4").copy()
+    if result.ndim == 3:
+        valid = np.isfinite(result) & (np.abs(result) < 0.5 * float(FILL))
+        result[~valid] = np.nan
+        if not valid.any():
+            return np.full_like(result, fallback)
+        if not valid.all():
+            nearest = distance_transform_edt(~valid, return_distances=False,
+                                             return_indices=True)
+            result[~valid] = result[tuple(nearest[:, ~valid])]
+        return result
     leading = result.shape[:-2]
     for index in np.ndindex(leading):
         plane = result[index]
@@ -168,17 +183,106 @@ def time_weighted(before_date: np.datetime64, before: tuple[np.ndarray, ...],
 def load_config(path: Path) -> SimpleNamespace:
     with path.open(encoding="utf-8") as f:
         cfg = json.load(f)
-    required = ("soda_dir", "hgrid", "output_dir", "start", "end")
+    required = ("soda_dir", "ocn_dir", "output_dir", "start", "end")
     missing = [name for name in required if name not in cfg]
     if missing:
         raise KeyError(f"Missing settings in {path}: {', '.join(missing)}")
     cfg["soda_dir"] = Path(cfg["soda_dir"])
-    cfg["hgrid"] = Path(cfg["hgrid"])
+    cfg["ocn_dir"] = Path(cfg["ocn_dir"])
+    # The parameter is the MOM6 ``ocn`` directory.  This avoids hard-coding
+    # hash-dependent hgrid/topog/vgrid filenames.
+    ocn_dir = cfg["ocn_dir"]
+    hgrids = sorted(ocn_dir.glob("ocean_hgrid_*.nc"))
+    if len(hgrids) != 1:
+        raise FileNotFoundError(
+            f"Expected exactly one ocean_hgrid_*.nc in {ocn_dir}, found {len(hgrids)}"
+        )
+    cfg["hgrid"] = hgrids[0]
     cfg["output_dir"] = Path(cfg["output_dir"])
+    # These are optional so existing parameter files remain valid.  For a
+    # standard MOM6 input directory, infer them from ocean_hgrid automatically.
+    hgrid_name = cfg["hgrid"].name
+    cfg.setdefault("topog", str(cfg["hgrid"].with_name(hgrid_name.replace("hgrid", "topog"))))
+    cfg.setdefault("vgrid", str(cfg["hgrid"].with_name(hgrid_name.replace("hgrid", "vgrid"))))
+    cfg["topog"] = Path(cfg["topog"])
+    cfg["vgrid"] = Path(cfg["vgrid"])
     cfg.setdefault("pattern", "soda3.15.2_5dy_ocean_or_*.nc")
     cfg.setdefault("log_file", "generate_soda_icbc.log")
     cfg.setdefault("initial_date", None)
     return SimpleNamespace(**cfg)
+
+
+def load_case_grid(cfg: SimpleNamespace, center_x: np.ndarray,
+                   center_y: np.ndarray) -> dict:
+    """Load the case bathymetry and derive MOM6 C-grid masks.
+
+    CrocoDash passes the case bathymetry into regional_mom6.  This local
+    implementation uses the same information explicitly so SODA output does
+    not contain source values over land or a full-depth column below the local
+    ocean bottom.
+    """
+    with xr.open_dataset(cfg.topog, decode_times=False) as topo:
+        mask = np.asarray(topo["mask"].values, dtype=bool)
+        depth = np.asarray(topo["depth"].values, dtype=float)
+        tx = np.asarray(topo["x"].values, dtype=float)
+        ty = np.asarray(topo["y"].values, dtype=float)
+    # The case topog is on tracer centers.  It is expected to match hgrid;
+    # retain a clear error instead of silently applying a shifted mask.
+    if mask.shape != center_x.shape:
+        raise ValueError(f"topog mask shape {mask.shape} does not match tracer grid {center_x.shape}")
+    # C-grid masks: a face is wet only when both neighboring tracer cells are
+    # wet.  At the outer edge, use the adjacent tracer cell.
+    umask = np.zeros((mask.shape[0], mask.shape[1] + 1), dtype=bool)
+    umask[:, 1:-1] = mask[:, :-1] & mask[:, 1:]
+    umask[:, 0] = mask[:, 0]
+    umask[:, -1] = mask[:, -1]
+    vmask = np.zeros((mask.shape[0] + 1, mask.shape[1]), dtype=bool)
+    vmask[1:-1, :] = mask[:-1, :] & mask[1:, :]
+    vmask[0, :] = mask[0, :]
+    vmask[-1, :] = mask[-1, :]
+    with xr.open_dataset(cfg.vgrid, decode_times=False) as vgrid:
+        dz = np.asarray(vgrid["dz"].values, dtype=float)
+    return {"mask": mask, "depth": depth, "umask": umask, "vmask": vmask,
+            "topo_x": tx, "topo_y": ty, "dz": dz,
+            "tree": cKDTree(np.column_stack((tx.ravel(), ty.ravel())))}
+
+
+def nearest_depth(mask_grid: dict, y: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """Nearest-neighbor case depth at arbitrary supergrid points."""
+    _, indices = mask_grid["tree"].query(
+        np.column_stack((x.ravel(), y.ravel())))
+    return mask_grid["depth"].ravel()[indices].reshape(y.shape)
+
+
+def nearest_mask(mask_grid: dict, y: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """Nearest-neighbor wet mask at arbitrary supergrid points."""
+    _, indices = mask_grid["tree"].query(
+        np.column_stack((x.ravel(), y.ravel())))
+    return mask_grid["mask"].ravel()[indices].reshape(y.shape)
+
+
+def local_layer_thickness(dz: np.ndarray, depth: np.ndarray) -> np.ndarray:
+    """Clip nominal MOM6 layer thicknesses to local bathymetry."""
+    edges = np.concatenate(([0.0], np.cumsum(dz)))
+    out = np.maximum(0.0, np.minimum(edges[1:, None, None], depth[None])
+                     - edges[:-1, None, None])
+    return out.astype("f4")
+
+
+def apply_mask_and_depth(fields: tuple[np.ndarray, ...], masks: tuple[np.ndarray, ...],
+                         dz: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Apply wet masks and remove values below each local ocean bottom."""
+    u, v, eta, temp, salt = fields
+    um, vm, tm = masks
+    wet_u = um[None] & (dz > 0)
+    wet_v = vm[None] & (dz > 0)
+    wet_t = tm[None] & (dz > 0)
+    u = np.where(wet_u, u, 0.0).astype("f4")
+    v = np.where(wet_v, v, 0.0).astype("f4")
+    temp = np.where(wet_t, temp, 0.0).astype("f4")
+    salt = np.where(wet_t, salt, 0.0).astype("f4")
+    eta = np.where(tm, eta, 0.0).astype("f4")
+    return u, v, eta, temp, salt
 
 
 def lon_for_source(lon: np.ndarray, target: np.ndarray) -> np.ndarray:
@@ -270,6 +374,9 @@ def main() -> None:
         west_y, west_x = lat[:, 0:1], lon[:, 0:1]
     log.info("Grid sizes: tracer=%s, u=%s, v=%s", center_x.shape, u_x.shape,
              v_x.shape)
+    case_grid = load_case_grid(a, center_x, center_y)
+    log.info("Using case bathymetry mask: %s", a.topog)
+    log.info("Using case vertical grid metadata: %s", a.vgrid)
 
     a.output_dir.mkdir(parents=True, exist_ok=True)
     log.info("Output directory: %s", a.output_dir)
@@ -309,7 +416,26 @@ def main() -> None:
             eta = fill_zero(eta)
             u_center = fill_zero(u_center)
             v_center = fill_zero(v_center)
-            center_fields = (temp, salt, eta, u_center, v_center)
+            center_dz = local_layer_thickness(
+                np.diff(depth_edges), case_grid["depth"])
+            u_dz = local_layer_thickness(
+                np.diff(depth_edges), nearest_depth(case_grid, u_y, u_x))
+            v_dz = local_layer_thickness(
+                np.diff(depth_edges), nearest_depth(case_grid, v_y, v_x))
+            u_center = np.where((u_dz > 0.0) & case_grid["umask"][None],
+                                u_center, 0.0).astype("f4")
+            v_center = np.where((v_dz > 0.0) & case_grid["vmask"][None],
+                                v_center, 0.0).astype("f4")
+            temp = np.where((center_dz > 0.0) & case_grid["mask"][None],
+                            temp, 0.0).astype("f4")
+            salt = np.where((center_dz > 0.0) & case_grid["mask"][None],
+                            salt, 0.0).astype("f4")
+            eta = np.where(case_grid["mask"], eta, 0.0).astype("f4")
+            center_fields = (u_center, v_center, eta, temp, salt)
+            # Keep the historical tuple order used by time interpolation:
+            # temp, salt, eta, u, v.
+            center_fields = (center_fields[3], center_fields[4],
+                             center_fields[2], center_fields[0], center_fields[1])
             if date == initial:
                 initial_fields = center_fields
             elif (initial_fields is None and previous_center is not None
@@ -335,11 +461,21 @@ def main() -> None:
                 tt = fill_nearest(tt)
                 ts = fill_nearest(ts)
                 te = fill_zero(te)
+                boundary_mask = nearest_mask(case_grid, yy, xx)
+                boundary_depth = nearest_depth(case_grid, yy, xx)
+                boundary_dz = local_layer_thickness(
+                    np.diff(depth_edges), boundary_depth)
+                wet = boundary_dz > 0.0
+                tu = np.where(wet & boundary_mask[None], tu, 0.0).astype("f4")
+                tv = np.where(wet & boundary_mask[None], tv, 0.0).astype("f4")
+                tt = np.where(wet & boundary_mask[None], tt, 0.0).astype("f4")
+                ts = np.where(wet & boundary_mask[None], ts, 0.0).astype("f4")
+                te = np.where(boundary_mask, te, 0.0).astype("f4")
                 current = (tu, tv, te, tt, ts)
                 if seg not in writers:
                     writers[seg] = OBCWriter(
                         a.output_dir / f"forcing_obc_segment_{seg:03d}.nc", seg,
-                        depth, np.diff(depth_edges), obc_coords[seg][0],
+                        depth, boundary_dz, obc_coords[seg][0],
                         obc_coords[seg][1], t0)
                 previous = previous_obc.get(seg)
                 if date < start:
